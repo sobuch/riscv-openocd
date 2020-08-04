@@ -213,6 +213,8 @@ typedef struct {
 	bool abstract_read_fpr_supported;
 	bool abstract_write_fpr_supported;
 
+	yes_no_maybe_t has_postincrement;
+
 	/* When a function returns some error due to a failure indicated by the
 	 * target in cmderr, the caller can look here to see what that error was.
 	 * (Compare with errno.) */
@@ -2653,7 +2655,9 @@ static int batch_run(const struct target *target, struct riscv_batch *batch)
 static int read_memory_abstract(struct target *target, target_addr_t address,
 		uint32_t size, uint32_t count, uint8_t *buffer)
 {
+	RISCV013_INFO(info);
 	int result = ERROR_OK;
+	bool use_postincrement = info->has_postincrement != YNM_NO;
 
 	LOG_DEBUG("reading %d words of %d bytes from 0x%" TARGET_PRIxADDR, count,
 			  size, address);
@@ -2670,17 +2674,17 @@ static int read_memory_abstract(struct target *target, target_addr_t address,
 	}
 
 	/* Create the command (physical address, postincrement, read) */
-	uint32_t command = access_memory_command(target, false, width, true, false);
+	uint32_t command = access_memory_command(target, false, width, use_postincrement, false);
 
 	/* Execute the reads */
 	uint8_t *p = buffer;
 	bool updateaddr = true;
 	unsigned width32 = (width + 31) / 32 * 32;
 	for (uint32_t c = 0; c < count; c++) {
-		/* Only update the addres initially and let postincrement update it */
+		/* Only update the address initially and let postincrement update it, if available */
 		if (updateaddr) {
 			/* Set arg1 to the address: address + c * size */
-			result = write_abstract_arg(target, 1, address, riscv_xlen(target));
+			result = write_abstract_arg(target, 1, address + c * size, riscv_xlen(target));
 			if (result != ERROR_OK) {
 				LOG_ERROR("Failed to write arg1 during read_memory_abstract().");
 				return result;
@@ -2689,6 +2693,29 @@ static int read_memory_abstract(struct target *target, target_addr_t address,
 
 		/* Execute the command */
 		result = execute_abstract_command(target, command);
+
+		if (info->has_postincrement == YNM_MAYBE) {
+			if (result == ERROR_OK) {
+				/* Safety: double-check that the address was really auto-incremented */
+				riscv_reg_t new_address = read_abstract_arg(target, 1, riscv_xlen(target));
+				if (new_address == address) {
+					LOG_DEBUG("Buggy postincrement! Address not inceremented.");
+					info->has_postincrement = YNM_NO;
+				} else {
+					LOG_DEBUG("Postincrement is supported on this target.");
+					info->has_postincrement = YNM_YES;
+				}
+			} else {
+				/* Try the same access but with postincrement disabled. */
+				command = access_memory_command(target, false, width, false, false);
+				result = execute_abstract_command(target, command);
+				if (result == ERROR_OK) {
+					LOG_DEBUG("Postincrement is not supported on this target.");
+					info->has_postincrement = YNM_NO;
+				}
+			}
+		}
+
 		if (result != ERROR_OK) {
 			LOG_ERROR("Failed to execute command read_memory_abstract().");
 			return result;
@@ -2698,7 +2725,8 @@ static int read_memory_abstract(struct target *target, target_addr_t address,
 		riscv_reg_t value = read_abstract_arg(target, 0, width32);
 		write_to_buf(p, value, size);
 
-		updateaddr = false;
+		if (info->has_postincrement == YNM_YES)
+			updateaddr = false;
 		p += size;
 	}
 
@@ -2713,7 +2741,9 @@ static int read_memory_abstract(struct target *target, target_addr_t address,
 static int write_memory_abstract(struct target *target, target_addr_t address,
 		uint32_t size, uint32_t count, const uint8_t *buffer)
 {
+	RISCV013_INFO(info);
 	int result = ERROR_OK;
+	bool use_postincrement = info->has_postincrement != YNM_NO;
 
 	LOG_DEBUG("writing %d words of %d bytes from 0x%" TARGET_PRIxADDR, count,
 			  size, address);
@@ -2728,7 +2758,7 @@ static int write_memory_abstract(struct target *target, target_addr_t address,
 	}
 
 	/* Create the command (physical address, postincrement, write) */
-	uint32_t command = access_memory_command(target, false, width, true, true);
+	uint32_t command = access_memory_command(target, false, width, use_postincrement, true);
 
 	/* Execute the writes */
 	const uint8_t *p = buffer;
@@ -2742,10 +2772,10 @@ static int write_memory_abstract(struct target *target, target_addr_t address,
 			return result;
 		  }
 
-		/* Only update the addres initially and let postincrement update it */
+		/* Only update the address initially and let postincrement update it, if available */
 		if (updateaddr) {
 			/* Set arg1 to the address: address + c * size */
-			result = write_abstract_arg(target, 1, address, riscv_xlen(target));
+			result = write_abstract_arg(target, 1, address + c * size, riscv_xlen(target));
 			if (result != ERROR_OK) {
 				LOG_ERROR("Failed to write arg1 during write_memory_abstract().");
 				return result;
@@ -2754,12 +2784,36 @@ static int write_memory_abstract(struct target *target, target_addr_t address,
 
 		/* Execute the command */
 		result = execute_abstract_command(target, command);
+
+		if (info->has_postincrement == YNM_MAYBE) {
+			if (result == ERROR_OK) {
+				/* Safety: double-check that the address was really auto-incremented */
+				riscv_reg_t new_address = read_abstract_arg(target, 1, riscv_xlen(target));
+				if (new_address == address) {
+					LOG_DEBUG("Buggy postincrement! Address not inceremented.");
+					info->has_postincrement = YNM_NO;
+				} else {
+					LOG_DEBUG("Postincrement is supported on this target.");
+					info->has_postincrement = YNM_YES;
+				}
+			} else {
+				/* Try the same access but with postincrement disabled. */
+				command = access_memory_command(target, false, width, false, true);
+				result = execute_abstract_command(target, command);
+				if (result == ERROR_OK) {
+					LOG_DEBUG("Postincrement is not supported on this target.");
+					info->has_postincrement = YNM_NO;
+				}
+			}
+		}
+
 		if (result != ERROR_OK) {
 			LOG_ERROR("Failed to execute command write_memory_abstract().");
 			return result;
 		}
 
-		updateaddr = false;
+		if (info->has_postincrement == YNM_YES)
+			updateaddr = false;
 		p += size;
 	}
 
