@@ -2682,12 +2682,14 @@ static void log_mem_access_result(struct target *target, bool success, int metho
 	bool warn = false;
 	char msg[60];
 
-	sprintf(msg, "%s to %s memory via %s.",
+	/* Compose the message */
+	snprintf(msg, 60, "%s to %s memory via %s.",
 			success ? "Succeeded" : "Failed",
 			read ? "read" : "write",
 			(method == RISCV_MEM_ACCESS_PROGBUF) ? "program buffer" :
 			(method == RISCV_MEM_ACCESS_SYSBUS) ? "system bus" : "abstract access");
 
+	/* Determine the log message severity. Show warnings only once. */
 	if (!success) {
 		if (method == RISCV_MEM_ACCESS_PROGBUF) {
 			warn = r->mem_access_progbuf_warn;
@@ -2709,13 +2711,15 @@ static void log_mem_access_result(struct target *target, bool success, int metho
 		LOG_DEBUG("%s", msg);
 }
 
-static bool mem_access_progbuf_skip(struct target *target, target_addr_t address,
-		uint32_t size, char **skip_reason, bool read)
+static bool mem_should_skip_progbuf(struct target *target, target_addr_t address,
+		uint32_t size, bool read, char **skip_reason)
 {
+	assert(skip_reason);
+
 	if (!has_sufficient_progbuf(target, 3)) {
 		LOG_DEBUG("Skipping mem %s via progbuf - insufficient progbuf size.",
 				read ? "read" : "write");
-		*skip_reason = "skipped (insufficient progbuf size)";
+		*skip_reason = "skipped (insufficient progbuf)";
 		return true;
 	}
 	if (target->state != TARGET_HALTED) {
@@ -2739,16 +2743,18 @@ static bool mem_access_progbuf_skip(struct target *target, target_addr_t address
 	if ((sizeof(address) * 8 > riscv_xlen(target)) && (address >> riscv_xlen(target))) {
 		LOG_DEBUG("Skipping mem %s via progbuf - progbuf only supports %u-bit address.",
 				read ? "read" : "write", riscv_xlen(target));
-		*skip_reason = "skipped (unsupported address)";
+		*skip_reason = "skipped (too large address)";
 		return true;
 	}
 
 	return false;
 }
 
-static bool mem_access_sysbus_skip(struct target *target, target_addr_t address,
-		uint32_t size, uint32_t increment, char **skip_reason, bool read)
+static bool mem_should_skip_sysbus(struct target *target, target_addr_t address,
+		uint32_t size, uint32_t increment, bool read, char **skip_reason)
 {
+	assert(skip_reason);
+
 	RISCV013_INFO(info);
 	if ((!get_field(info->sbcs, DM_SBCS_SBACCESS8) || size != 1) &&
 			(!get_field(info->sbcs, DM_SBCS_SBACCESS16) || size != 2) &&
@@ -2764,7 +2770,7 @@ static bool mem_access_sysbus_skip(struct target *target, target_addr_t address,
 	if ((sizeof(address) * 8 > sbasize) && (address >> sbasize)) {
 		LOG_DEBUG("Skipping mem %s via system bus - sba only supports %u-bit address.",
 				read ? "read" : "write", sbasize);
-		*skip_reason = "skipped (unsupported address)";
+		*skip_reason = "skipped (too large address)";
 		return true;
 	}
 	if (read && increment != size && (get_field(info->sbcs, DM_SBCS_SBVERSION) == 0 || increment != 0)) {
@@ -2777,23 +2783,26 @@ static bool mem_access_sysbus_skip(struct target *target, target_addr_t address,
 	return false;
 }
 
-static bool mem_access_abstract_skip(struct target *target, target_addr_t address,
-		uint32_t size, uint32_t increment, char **skip_reason, bool read)
+static bool mem_should_skip_abstract(struct target *target, target_addr_t address,
+		uint32_t size, uint32_t increment, bool read, char **skip_reason)
 {
+	assert(skip_reason);
+
 	if (size > 8) {
 		/* TODO: Add 128b support if it's ever used. Involves modifying
 				 read/write_abstract_arg() to work on two 64b values. */
-		LOG_DEBUG("Skipping mem read via abstract access - unsupported size: %d bits", size * 8);
+		LOG_DEBUG("Skipping mem %s via abstract access - unsupported size: %d bits",
+				read ? "read" : "write", size * 8);
 		*skip_reason = "skipped (unsupported size)";
 		return true;
 	}
 	if ((sizeof(address) * 8 > riscv_xlen(target)) && (address >> riscv_xlen(target))) {
-		LOG_DEBUG("Skipping read write via abstract access - abstract access only supports %u-bit address.",
-				riscv_xlen(target));
-		*skip_reason = "skipped (unsupported address)";
+		LOG_DEBUG("Skipping mem %s via abstract access - abstract access only supports %u-bit address.",
+				read ? "read" : "write", riscv_xlen(target));
+		*skip_reason = "skipped (too large address)";
 		return true;
 	}
-	if (size != increment) {
+	if (read && size != increment) {
 		LOG_ERROR("Skipping mem read via abstract access - "
 				"abstract command reads only support size==increment.");
 		*skip_reason = "skipped (unsupported increment)";
@@ -3406,7 +3415,7 @@ static int read_memory(struct target *target, target_addr_t address,
 		int method = r->mem_access_methods[i];
 
 		if (method == RISCV_MEM_ACCESS_PROGBUF) {
-			bool skip = mem_access_progbuf_skip(target, address, size, &progbuf_result, true);
+			bool skip = mem_should_skip_progbuf(target, address, size, true, &progbuf_result);
 			if (skip)
 				continue;
 
@@ -3415,7 +3424,7 @@ static int read_memory(struct target *target, target_addr_t address,
 			if (ret != ERROR_OK)
 				progbuf_result = "failed";
 		} else if (method == RISCV_MEM_ACCESS_SYSBUS) {
-			bool skip = mem_access_sysbus_skip(target, address, size, increment, &sysbus_result, true);
+			bool skip = mem_should_skip_sysbus(target, address, size, increment, true, &sysbus_result);
 			if (skip)
 				continue;
 
@@ -3427,7 +3436,7 @@ static int read_memory(struct target *target, target_addr_t address,
 			if (ret != ERROR_OK)
 				sysbus_result = "failed";
 		} else if (method == RISCV_MEM_ACCESS_ABSTRACT) {
-			bool skip = mem_access_abstract_skip(target, address, size, increment, &abstract_result, true);
+			bool skip = mem_should_skip_abstract(target, address, size, increment, true, &abstract_result);
 			if (skip)
 				continue;
 
@@ -3860,7 +3869,7 @@ static int write_memory(struct target *target, target_addr_t address,
 		int method = r->mem_access_methods[i];
 
 		if (method == RISCV_MEM_ACCESS_PROGBUF) {
-			bool skip = mem_access_progbuf_skip(target, address, size, &progbuf_result, false);
+			bool skip = mem_should_skip_progbuf(target, address, size, false, &progbuf_result);
 			if (skip)
 				continue;
 
@@ -3869,7 +3878,7 @@ static int write_memory(struct target *target, target_addr_t address,
 			if (ret != ERROR_OK)
 				progbuf_result = "failed";
 		} else if (method == RISCV_MEM_ACCESS_SYSBUS) {
-			bool skip = mem_access_sysbus_skip(target, address, size, 0, &sysbus_result, false);
+			bool skip = mem_should_skip_sysbus(target, address, size, 0, false, &sysbus_result);
 			if (skip)
 				continue;
 
@@ -3881,7 +3890,7 @@ static int write_memory(struct target *target, target_addr_t address,
 			if (ret != ERROR_OK)
 				sysbus_result = "failed";
 		} else if (method == RISCV_MEM_ACCESS_ABSTRACT) {
-			bool skip = mem_access_abstract_skip(target, address, size, 0, &abstract_result, false);
+			bool skip = mem_should_skip_abstract(target, address, size, 0, false, &abstract_result);
 			if (skip)
 				continue;
 
