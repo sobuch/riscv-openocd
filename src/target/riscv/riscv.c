@@ -259,18 +259,6 @@ bool riscv_ebreaku = true;
 
 bool riscv_enable_virtual;
 
-typedef struct {
-	uint16_t low, high;
-} range_t;
-
-/* In addition to the ones in the standard spec, we'll also expose additional
- * CSRs in this list.
- * The list is either NULL, or a series of ranges (inclusive), terminated with
- * 1,0. */
-range_t *expose_csr;
-/* Same, but for custom registers. */
-range_t *expose_custom;
-
 static enum {
 	RO_NORMAL,
 	RO_REVERSED
@@ -530,15 +518,19 @@ static void riscv_free_registers(struct target *target)
 static void riscv_deinit_target(struct target *target)
 {
 	LOG_DEBUG("riscv_deinit_target()");
+	RISCV_INFO(r);
+
 	struct target_type *tt = get_target_type(target);
-	if (tt) {
+
+	if (tt && r->version_specific)
 		tt->deinit_target(target);
-		riscv_info_t *info = (riscv_info_t *) target->arch_info;
-		free(info->reg_names);
-		free(info);
-	}
 
 	riscv_free_registers(target);
+
+	free(r->reg_names);
+	free(r->expose_csr);
+	free(r->expose_custom);
+	free(r);
 
 	target->arch_info = NULL;
 }
@@ -2515,66 +2507,121 @@ void parse_error(const char *string, char c, unsigned position)
 	LOG_ERROR("%s", buf);
 }
 
+enum riscv_parse_ranges_stage {
+	RISCV_PARSE_RANGE_T_LOW,
+	RISCV_PARSE_RANGE_T_HIGH,
+	RISCV_PARSE_RANGE_T_ID,
+	RISCV_PARSE_RANGE_T_END
+};
+
 int parse_ranges(range_t **ranges, const char **argv)
 {
-	for (unsigned pass = 0; pass < 2; pass++) {
-		unsigned range = 0;
-		unsigned low = 0;
-		bool parse_low = true;
-		unsigned high = 0;
-		for (unsigned i = 0; i == 0 || argv[0][i-1]; i++) {
-			char c = argv[0][i];
-			if (isspace(c)) {
-				/* Ignore whitespace. */
-				continue;
+	/* Deduce number of ranges. */
+	unsigned num_ranges = 1;
+	for (unsigned i = 0; argv[0][i] != 0; i++)
+		if (argv[0][i] == ',')
+			num_ranges++;
+
+	/* Count already existing ranges. */
+	unsigned num_ranges_old = 0;
+	range_t *tmp_ranges = *ranges;
+	for (unsigned i = 0; tmp_ranges && tmp_ranges[i].low <= tmp_ranges[i].high; i++)
+		num_ranges_old++;
+
+	*ranges = calloc(num_ranges + num_ranges_old + 1, sizeof(range_t));
+	if (!*ranges)
+		return ERROR_FAIL;
+
+	/* Copy already created ranges to the end. */
+	if (tmp_ranges) {
+		memcpy(*ranges + num_ranges, tmp_ranges, num_ranges_old * sizeof(range_t));
+		free(tmp_ranges);
+	}
+
+	/* Terminating range. */
+	(*ranges)[num_ranges + num_ranges_old].low = 1;
+	(*ranges)[num_ranges + num_ranges_old].high = 0;
+
+	unsigned range = 0;
+	unsigned low = 0;
+	unsigned high = 0;
+	char id[32] = {0};
+	unsigned id_pos = 0;
+	enum riscv_parse_ranges_stage stage = RISCV_PARSE_RANGE_T_LOW;
+
+	for (unsigned i = 0; i == 0 || argv[0][i-1]; i++) {
+		char c = argv[0][i];
+		if (isspace(c)) {
+			/* Ignore whitespace. */
+			continue;
+		}
+
+		if (stage == RISCV_PARSE_RANGE_T_END) {
+			if (c == ',' || c == 0) {
+				/* Expected more ranges. */
+				parse_error(argv[0], c, i);
+				return ERROR_COMMAND_SYNTAX_ERROR;
 			}
+			stage = RISCV_PARSE_RANGE_T_LOW;
+		}
 
-			if (parse_low) {
-				if (isdigit(c)) {
-					low *= 10;
-					low += c - '0';
-				} else if (c == '-') {
-					parse_low = false;
-				} else if (c == ',' || c == 0) {
-					if (pass == 1) {
-						(*ranges)[range].low = low;
-						(*ranges)[range].high = low;
-					}
-					low = 0;
-					range++;
-				} else {
-					parse_error(argv[0], c, i);
-					return ERROR_COMMAND_SYNTAX_ERROR;
-				}
-
+		if (stage == RISCV_PARSE_RANGE_T_LOW) {
+			/* Parse lower bound of the range. */
+			if (isdigit(c)) {
+				low *= 10;
+				low += c - '0';
+			} else if (c == '-')
+				stage = RISCV_PARSE_RANGE_T_HIGH;
+			else if (c == '=')
+				stage = RISCV_PARSE_RANGE_T_ID;
+			else if (c == ',' || c == 0)
+				stage = RISCV_PARSE_RANGE_T_END;
+			else {
+				parse_error(argv[0], c, i);
+				return ERROR_COMMAND_SYNTAX_ERROR;
+			}
+		} else if (stage == RISCV_PARSE_RANGE_T_HIGH) {
+			/* Parse upper bound of the range. */
+			if (isdigit(c)) {
+				high *= 10;
+				high += c - '0';
+			} else if (c == ',' || c == 0)
+				stage = RISCV_PARSE_RANGE_T_END;
+			else {
+				parse_error(argv[0], c, i);
+				return ERROR_COMMAND_SYNTAX_ERROR;
+			}
+		} else if (stage == RISCV_PARSE_RANGE_T_ID) {
+			/* Parse id of the range. */
+			if (c == ',' || c == 0)
+				stage = RISCV_PARSE_RANGE_T_END;
+			else if (id_pos < 31) {
+				id[id_pos] = c;
+				id_pos++;
 			} else {
-				if (isdigit(c)) {
-					high *= 10;
-					high += c - '0';
-				} else if (c == ',' || c == 0) {
-					parse_low = true;
-					if (pass == 1) {
-						(*ranges)[range].low = low;
-						(*ranges)[range].high = high;
-					}
-					low = 0;
-					high = 0;
-					range++;
-				} else {
-					parse_error(argv[0], c, i);
-					return ERROR_COMMAND_SYNTAX_ERROR;
-				}
+				parse_error(argv[0], c, i);
+				return ERROR_COMMAND_SYNTAX_ERROR;
 			}
 		}
 
-		if (pass == 0) {
-			free(*ranges);
-			*ranges = calloc(range + 2, sizeof(range_t));
-			if (!*ranges)
-				return ERROR_FAIL;
-		} else {
-			(*ranges)[range].low = 1;
-			(*ranges)[range].high = 0;
+		if (stage == RISCV_PARSE_RANGE_T_END) {
+			/* Whole range parsed. */
+			high = high > low ? high : low;
+
+			/* Check for overlap. */
+			for (unsigned j = 0; (*ranges)[j].low <= (*ranges)[j].high; j++)
+				if (((*ranges)[j].low <= high) && (low <= (*ranges)[j].high))
+					LOG_WARNING("Range starting from %u is overlapping with already "
+							"specified range starting from %u.", low, (*ranges)[j].low);
+
+			(*ranges)[range].low = low;
+			(*ranges)[range].high = high;
+			strncpy((*ranges)[range].id, id, 32);
+			low = 0;
+			high = 0;
+			memset(id, 0, sizeof(id));
+			id_pos = 0;
+			range++;
 		}
 	}
 
@@ -2588,7 +2635,10 @@ COMMAND_HANDLER(riscv_set_expose_csrs)
 		return ERROR_COMMAND_SYNTAX_ERROR;
 	}
 
-	return parse_ranges(&expose_csr, CMD_ARGV);
+	struct target *target = get_current_target(CMD_CTX);
+	RISCV_INFO(info);
+
+	return parse_ranges(&info->expose_csr, CMD_ARGV);
 }
 
 COMMAND_HANDLER(riscv_set_expose_custom)
@@ -2598,7 +2648,10 @@ COMMAND_HANDLER(riscv_set_expose_custom)
 		return ERROR_COMMAND_SYNTAX_ERROR;
 	}
 
-	return parse_ranges(&expose_custom, CMD_ARGV);
+	struct target *target = get_current_target(CMD_CTX);
+	RISCV_INFO(info);
+
+	return parse_ranges(&info->expose_custom, CMD_ARGV);
 }
 
 COMMAND_HANDLER(riscv_authdata_read)
@@ -2958,8 +3011,8 @@ static const struct command_registration riscv_exec_command_handlers[] = {
 	{
 		.name = "expose_csrs",
 		.handler = riscv_set_expose_csrs,
-		.mode = COMMAND_ANY,
-		.usage = "n0[-m0][,n1[-m1]]...",
+		.mode = COMMAND_CONFIG,
+		.usage = "n0[-m0|=name0][,n1[-m1|=name1]]...",
 		.help = "Configure a list of inclusive ranges for CSRs to expose in "
 				"addition to the standard ones. This must be executed before "
 				"`init`."
@@ -2967,8 +3020,8 @@ static const struct command_registration riscv_exec_command_handlers[] = {
 	{
 		.name = "expose_custom",
 		.handler = riscv_set_expose_custom,
-		.mode = COMMAND_ANY,
-		.usage = "n0[-m0][,n1[-m1]]...",
+		.mode = COMMAND_CONFIG,
+		.usage = "n0[-m0|=name0][,n1[-m1|=name1]]...",
 		.help = "Configure a list of inclusive ranges for custom registers to "
 			"expose. custom0 is accessed as abstract register number 0xc000, "
 			"etc. This must be executed before `init`."
@@ -3934,10 +3987,10 @@ int riscv_init_registers(struct target *target)
 	target->reg_cache->name = "RISC-V Registers";
 	target->reg_cache->num_regs = GDB_REGNO_COUNT;
 
-	if (expose_custom) {
-		for (unsigned i = 0; expose_custom[i].low <= expose_custom[i].high; i++) {
-			for (unsigned number = expose_custom[i].low;
-					number <= expose_custom[i].high;
+	if (info->expose_custom) {
+		for (unsigned i = 0; info->expose_custom[i].low <= info->expose_custom[i].high; i++) {
+			for (unsigned number = info->expose_custom[i].low;
+					number <= info->expose_custom[i].high;
 					number++)
 				target->reg_cache->num_regs++;
 		}
@@ -4479,10 +4532,27 @@ int riscv_init_registers(struct target *target)
 					break;
 			}
 
-			if (!r->exist && expose_csr) {
-				for (unsigned i = 0; expose_csr[i].low <= expose_csr[i].high; i++) {
-					if (csr_number >= expose_csr[i].low && csr_number <= expose_csr[i].high) {
+			if (!r->exist && info->expose_csr) {
+				for (unsigned i = 0; info->expose_csr[i].low <= info->expose_csr[i].high; i++) {
+					if (csr_number >= info->expose_csr[i].low && csr_number <= info->expose_csr[i].high) {
 						LOG_INFO("Exposing additional CSR %d", csr_number);
+						if (info->expose_csr[i].id[0]) {
+							/* Check whether the name is unique. */
+							bool reg_name_unique = true;
+							for (char *reg_name_tmp = info->reg_names; *reg_name_tmp;
+									reg_name_tmp += strlen(reg_name_tmp) + 1) {
+								if (strcmp(reg_name_tmp, info->expose_csr[i].id) == 0) {
+									LOG_WARNING("Register with name %s already registered.", reg_name_tmp);
+									reg_name_unique = false;
+									break;
+								}
+							}
+
+							if (reg_name_unique) {
+								strcpy(reg_name, info->expose_csr[i].id);
+								LOG_INFO("it will be available as %s", reg_name);
+							}
+						}
 						r->exist = true;
 						break;
 					}
@@ -4506,9 +4576,9 @@ int riscv_init_registers(struct target *target)
 
 		} else if (number >= GDB_REGNO_COUNT) {
 			/* Custom registers. */
-			assert(expose_custom);
+			assert(info->expose_custom);
 
-			range_t *range = &expose_custom[custom_range_index];
+			range_t *range = &info->expose_custom[custom_range_index];
 			assert(range->low <= range->high);
 			unsigned custom_number = range->low + custom_within_range;
 
@@ -4521,6 +4591,25 @@ int riscv_init_registers(struct target *target)
 			((riscv_reg_info_t *) r->arch_info)->custom_number = custom_number;
 			sprintf(reg_name, "custom%d", custom_number);
 
+			LOG_INFO("Exposing additional custom register %d", number);
+			if (info->expose_custom[custom_range_index].id[0]) {
+				/* Check whether the name is unique. */
+				bool reg_name_unique = true;
+				for (char *reg_name_tmp = info->reg_names; *reg_name_tmp;
+						reg_name_tmp += strlen(reg_name_tmp) + 1) {
+					if (strcmp(reg_name_tmp, info->expose_custom[custom_range_index].id) == 0) {
+						LOG_WARNING("Register with name %s already registered.", reg_name_tmp);
+						reg_name_unique = false;
+						break;
+					}
+				}
+
+				if (reg_name_unique) {
+					strcpy(reg_name, info->expose_custom[custom_range_index].id);
+					LOG_INFO("it will be available as %s", reg_name);
+				}
+			}
+
 			custom_within_range++;
 			if (custom_within_range > range->high - range->low) {
 				custom_within_range = 0;
@@ -4528,11 +4617,12 @@ int riscv_init_registers(struct target *target)
 			}
 		}
 
-		if (reg_name[0])
+		if (reg_name[0]) {
 			r->name = reg_name;
-		reg_name += strlen(reg_name) + 1;
-		assert(reg_name < info->reg_names + target->reg_cache->num_regs *
-				max_reg_name_len);
+			reg_name += strlen(reg_name) + 1;
+			assert(reg_name < info->reg_names + target->reg_cache->num_regs *
+					max_reg_name_len);
+		}
 		r->value = &info->reg_cache_values[number];
 	}
 
