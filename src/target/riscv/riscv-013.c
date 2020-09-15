@@ -2218,64 +2218,6 @@ static int deassert_reset(struct target *target)
 	return ERROR_OK;
 }
 
-/**
- * @par size in bytes
- */
-static uint64_t read_from_buf(const uint8_t *buffer, unsigned size)
-{
-	switch (size) {
-		case 1:
-			return buffer[0];
-		case 2:
-			return buffer[0]
-				| ((uint64_t)buffer[1] << 8);
-		case 4:
-			return buffer[0]
-				| ((uint64_t)buffer[1] << 8)
-				| ((uint64_t)buffer[2] << 16)
-				| ((uint64_t)buffer[3] << 24);
-		case 8:
-			return buffer[0]
-				| ((uint64_t)buffer[1] << 8)
-				| ((uint64_t)buffer[2] << 16)
-				| ((uint64_t)buffer[3] << 24)
-				| ((uint64_t)buffer[4] << 32)
-				| ((uint64_t)buffer[5] << 40)
-				| ((uint64_t)buffer[6] << 48)
-				| ((uint64_t)buffer[7] << 56);
-		default:
-			assert(false);
-	}
-	return -1;
-}
-
-/**
- * @par size in bytes
- */
-static void write_to_buf(uint8_t *buffer, uint64_t value, unsigned size)
-{
-	switch (size) {
-		case 8:
-			buffer[7] = value >> 56;
-			buffer[6] = value >> 48;
-			buffer[5] = value >> 40;
-			buffer[4] = value >> 32;
-			/* falls through */
-		case 4:
-			buffer[3] = value >> 24;
-			buffer[2] = value >> 16;
-			/* falls through */
-		case 2:
-			buffer[1] = value >> 8;
-			/* falls through */
-		case 1:
-			buffer[0] = value;
-			break;
-		default:
-			assert(false);
-	}
-}
-
 static int execute_fence(struct target *target)
 {
 	int old_hartid = riscv_current_hartid(target);
@@ -2356,7 +2298,7 @@ static int read_memory_bus_word(struct target *target, target_addr_t address,
 		result = dmi_op(target, &value, NULL, DMI_OP_READ, sbdata[i], 0, false, true);
 		if (result != ERROR_OK)
 			return result;
-		write_to_buf(buffer + i * 4, value, MIN(size, 4));
+		buf_set_u32(buffer + i * 4, 0, 8 * MIN(size, 4), value);
 		log_memory_access(address + i * 4, value, MIN(size, 4), true);
 	}
 	return ERROR_OK;
@@ -2495,7 +2437,7 @@ static int read_memory_bus_v0(struct target *target, target_addr_t address,
 			if (dmi_read(target, &value, DM_SBDATA0) != ERROR_OK)
 				return ERROR_FAIL;
 			LOG_DEBUG("\r\nread_memory: sab: value:  0x%08x", value);
-			write_to_buf(t_buffer, value, size);
+			buf_set_u32(t_buffer, 0, 8 * size, value);
 			t_buffer += size;
 			cur_addr += size;
 		}
@@ -2524,7 +2466,7 @@ static int read_memory_bus_v0(struct target *target, target_addr_t address,
 		uint32_t value;
 		if (dmi_read(target, &value, DM_SBDATA0) != ERROR_OK)
 			return ERROR_FAIL;
-		write_to_buf(t_buffer, value, size);
+		buf_set_u32(t_buffer, 0, 8 * size, value);
 		cur_addr += size;
 		t_buffer += size;
 
@@ -2533,7 +2475,7 @@ static int read_memory_bus_v0(struct target *target, target_addr_t address,
 			dmi_write(target, DM_SBCS, 0);
 			if (dmi_read(target, &value, DM_SBDATA0) != ERROR_OK)
 				return ERROR_FAIL;
-			write_to_buf(t_buffer, value, size);
+			buf_set_u32(t_buffer, 0, 8 * size, value);
 		}
 	}
 
@@ -2603,7 +2545,7 @@ static int read_memory_bus_v1(struct target *target, target_addr_t address,
 						return ERROR_FAIL;
 				}
 				if (next_read != address - 1) {
-					write_to_buf(buffer + next_read - address, value, MIN(size, 4));
+					buf_set_u32(buffer + next_read - address, 0, 8 * MIN(size, 4), value);
 					log_memory_access(next_read, value, MIN(size, 4), true);
 				}
 				next_read = address + i * size + j * 4;
@@ -2628,7 +2570,7 @@ static int read_memory_bus_v1(struct target *target, target_addr_t address,
 				else
 					return ERROR_FAIL;
 			}
-			write_to_buf(buffer + next_read - address, value, MIN(size, 4));
+			buf_set_u32(buffer + next_read - address, 0, 8 * MIN(size, 4), value);
 			log_memory_access(next_read, value, MIN(size, 4), true);
 
 			/* "Writes to sbcs while sbbusy is high result in undefined behavior.
@@ -2896,7 +2838,7 @@ static int read_memory_abstract(struct target *target, target_addr_t address,
 
 		/* Copy arg0 to buffer (rounded width up to nearest 32) */
 		riscv_reg_t value = read_abstract_arg(target, 0, width32);
-		write_to_buf(p, value, size);
+		buf_set_u64(p, 0, 8 * size, value);
 
 		if (info->has_aampostincrement == YNM_YES)
 			updateaddr = false;
@@ -2932,7 +2874,7 @@ static int write_memory_abstract(struct target *target, target_addr_t address,
 	bool updateaddr = true;
 	for (uint32_t c = 0; c < count; c++) {
 		/* Move data to arg0 */
-		riscv_reg_t value = read_from_buf(p, size);
+		riscv_reg_t value = buf_get_u64(p, 0, 8 * size);
 		result = write_abstract_arg(target, 0, value, riscv_xlen(target));
 		if (result != ERROR_OK) {
 			LOG_ERROR("Failed to write arg0 during write_memory_abstract().");
@@ -3016,7 +2958,7 @@ static int read_memory_progbuf_inner(struct target *target, target_addr_t addres
 		uint64_t value;
 		if (register_read_direct(target, &value, GDB_REGNO_S1) != ERROR_OK)
 			return ERROR_FAIL;
-		write_to_buf(buffer, value, size);
+		buf_set_u64(buffer, 0, 8 * size, value);
 		log_memory_access(address, value, size, true);
 		return ERROR_OK;
 	}
@@ -3118,7 +3060,7 @@ static int read_memory_progbuf_inner(struct target *target, target_addr_t addres
 				}
 
 				uint64_t value64 = (((uint64_t)dmi_data1) << 32) | dmi_data0;
-				write_to_buf(buffer + (next_index - 2) * size, value64, size);
+				buf_set_u64(buffer + (next_index - 2) * size, 0, 8 * size, value64);
 				log_memory_access(address + (next_index - 2) * size, value64, size, true);
 
 				/* Restore the command, and execute it.
@@ -3184,7 +3126,7 @@ static int read_memory_progbuf_inner(struct target *target, target_addr_t addres
 				read++;
 			}
 			riscv_addr_t offset = j * size;
-			write_to_buf(buffer + offset, value, size);
+			buf_set_u64(buffer + offset, 0, 8 * size, value);
 			log_memory_access(address + j * increment, value, size, true);
 		}
 
@@ -3203,7 +3145,7 @@ static int read_memory_progbuf_inner(struct target *target, target_addr_t addres
 		if (size > 4 && dmi_read(target, &dmi_data1, DM_DATA1) != ERROR_OK)
 			return ERROR_FAIL;
 		uint64_t value64 = (((uint64_t)dmi_data1) << 32) | dmi_data0;
-		write_to_buf(buffer + size * (count - 2), value64, size);
+		buf_set_u64(buffer + size * (count - 2), 0, 8 * size, value64);
 		log_memory_access(address + size * (count - 2), value64, size, true);
 	}
 
@@ -3212,7 +3154,7 @@ static int read_memory_progbuf_inner(struct target *target, target_addr_t addres
 	result = register_read_direct(target, &value, GDB_REGNO_S1);
 	if (result != ERROR_OK)
 		goto error;
-	write_to_buf(buffer + size * (count-1), value, size);
+	buf_set_u64(buffer + size * (count-1), 0, 8 * size, value);
 	log_memory_access(address + size * (count-1), value, size, true);
 
 	return ERROR_OK;
@@ -3280,7 +3222,7 @@ static int read_memory_progbuf_one(struct target *target, target_addr_t address,
 	uint64_t value;
 	if (register_read(target, &value, GDB_REGNO_S0) != ERROR_OK)
 		return ERROR_FAIL;
-	write_to_buf(buffer, value, size);
+	buf_set_u64(buffer, 0, 8 * size, value);
 	log_memory_access(address, value, size, true);
 
 	if (riscv_set_register(target, GDB_REGNO_S0, s0) != ERROR_OK)
@@ -3389,8 +3331,7 @@ static int read_memory_progbuf(struct target *target, target_addr_t address,
 				LOG_DEBUG("error reading single word of %d bytes from 0x%" TARGET_PRIxADDR,
 						size, address_i);
 
-				uint64_t value_i = 0;
-				write_to_buf(buffer_i, value_i, size);
+				buf_set_u64(buffer_i, 0, 8 * size, 0);
 			}
 		}
 		result = ERROR_OK;
@@ -3488,26 +3429,7 @@ static int write_memory_bus_v0(struct target *target, target_addr_t address,
 
 	/* B.8 Writing Memory, single write check if we write in one go */
 	if (count == 1) { /* count is in bytes here */
-		/* TODO: Test with read_from_buf(&value, t_buffer, size) */
-		/* check the size */
-		switch (size) {
-			case 1:
-				value = t_buffer[0];
-				break;
-			case 2:
-				value = t_buffer[0]
-					| ((uint32_t) t_buffer[1] << 8);
-				break;
-			case 4:
-				value = t_buffer[0]
-					| ((uint32_t) t_buffer[1] << 8)
-					| ((uint32_t) t_buffer[2] << 16)
-					| ((uint32_t) t_buffer[3] << 24);
-				break;
-			default:
-				LOG_ERROR("unsupported access size: %d", size);
-				return ERROR_FAIL;
-		}
+		value = buf_get_u64(t_buffer, 0, 8 * size);
 
 		access = 0;
 		access = set_field(access, DM_SBCS_SBACCESS, size/2);
@@ -3533,25 +3455,7 @@ static int write_memory_bus_v0(struct target *target, target_addr_t address,
 		t_addr = address + offset;
 		t_buffer = buffer + offset;
 
-		/* TODO: Test with read_from_buf(&value, t_buffer, size) */
-		switch (size) {
-			case 1:
-				value = t_buffer[0];
-				break;
-			case 2:
-				value = t_buffer[0]
-					| ((uint32_t) t_buffer[1] << 8);
-				break;
-			case 4:
-				value = t_buffer[0]
-					| ((uint32_t) t_buffer[1] << 8)
-					| ((uint32_t) t_buffer[2] << 16)
-					| ((uint32_t) t_buffer[3] << 24);
-				break;
-			default:
-				LOG_ERROR("unsupported access size: %d", size);
-				return ERROR_FAIL;
-		}
+		value = buf_get_u64(t_buffer, 0, 8 * size);
 		LOG_DEBUG("SAB:autoincrement: expected address: 0x%08x value: 0x%08x"
 				PRIx64, (uint32_t)t_addr, (uint32_t)value);
 		dmi_write(target, DM_SBDATA0, value);
@@ -3761,7 +3665,7 @@ static int write_memory_progbuf(struct target *target, target_addr_t address,
 			unsigned offset = size*i;
 			const uint8_t *t_buffer = buffer + offset;
 
-			uint64_t value = read_from_buf(t_buffer, size);
+			uint64_t value = buf_get_u64(t_buffer, 0, 8 * size);
 
 			log_memory_access(address + offset, value, size, false);
 			cur_addr += size;
