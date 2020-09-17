@@ -772,7 +772,8 @@ static int ftdi_initialize(void)
 
 static int ftdi_quit(void)
 {
-	mpsse_close(mpsse_ctx);
+	if (mpsse_ctx)
+		mpsse_close(mpsse_ctx);
 
 	struct signal *sig = signals;
 	while (sig) {

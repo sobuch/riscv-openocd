@@ -1656,7 +1656,8 @@ int adapter_quit(void)
 		int result = jtag->quit();
 		if (ERROR_OK != result)
 			LOG_ERROR("failed: %d", result);
-	}
+	} else if (adapter_driver && adapter_driver->quit)
+		adapter_driver->quit();
 
 	struct jtag_tap *t = jtag_all_taps();
 	while (t) {
