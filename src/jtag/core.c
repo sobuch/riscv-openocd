@@ -1659,6 +1659,9 @@ int adapter_quit(void)
 	} else if (adapter_driver && adapter_driver->quit)
 		adapter_driver->quit();
 
+	jtag = NULL;
+	adapter_driver = NULL;
+
 	struct jtag_tap *t = jtag_all_taps();
 	while (t) {
 		struct jtag_tap *n = t->next_tap;

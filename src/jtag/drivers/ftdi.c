@@ -772,8 +772,7 @@ static int ftdi_initialize(void)
 
 static int ftdi_quit(void)
 {
-	if (mpsse_ctx)
-		mpsse_close(mpsse_ctx);
+	mpsse_close(mpsse_ctx);
 
 	struct signal *sig = signals;
 	while (sig) {
@@ -787,6 +786,10 @@ static int ftdi_quit(void)
 	free(ftdi_serial);
 
 	free(swd_cmd_queue);
+
+	ftdi_device_desc = NULL;
+	ftdi_serial = NULL;
+	swd_cmd_queue = NULL;
 
 	return ERROR_OK;
 }
