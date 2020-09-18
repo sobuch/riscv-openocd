@@ -1542,9 +1542,8 @@ static void deinit_target(struct target *target)
 	RISCV013_INFO(info);
 
 	target_list_t *entry, *tmp;
-	list_for_each_entry_safe(entry, tmp, &info->dm->target_list, list) {
+	list_for_each_entry_safe(entry, tmp, &info->dm->target_list, list)
 		free(entry);
-	}
 
 	free(info->dm);
 	free(r->version_specific);
