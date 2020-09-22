@@ -2503,7 +2503,7 @@ COMMAND_HANDLER(riscv_set_enable_virtual)
 	return ERROR_OK;
 }
 
-int parse_ranges(struct list_head *ranges, char *args)
+int parse_ranges(struct list_head *ranges, char *args, const char *reg_type, unsigned max_val)
 {
 	char *arg = strtok(args, ",");
 	while (arg) {
@@ -2516,37 +2516,71 @@ int parse_ranges(struct list_head *ranges, char *args)
 		unsigned pos;
 
 		if (!dash && !equals) {
+			/* Expecting single register number. */
 			if (sscanf(arg, "%u%n", &low, &pos) != 1 || pos != strlen(arg))
-				return ERROR_FAIL;
-		} else if (dash) {
+				return ERROR_COMMAND_SYNTAX_ERROR;
+		} else if (dash && !equals) {
+			/* Expecting register range - two numbers separated by a dash: ##-## */
 			*dash = 0;
 			dash++;
 			if (sscanf(arg, "%u%n", &low, &pos) != 1 || pos != strlen(arg))
-				return ERROR_FAIL;
+				return ERROR_COMMAND_SYNTAX_ERROR;
 			if (sscanf(dash, "%u%n", &high, &pos) != 1 || pos != strlen(dash))
+				return ERROR_COMMAND_SYNTAX_ERROR;
+			if (high < low) {
+				LOG_ERROR("Incorrect range encountered [%u, %u].", low, high);
 				return ERROR_FAIL;
-		} else if (equals) {
+			}
+		} else if (!dash && equals) {
+			/* Expecting single register number with textual name specified: ##=name */
 			*equals = 0;
 			equals++;
 			if (sscanf(arg, "%u%n", &low, &pos) != 1 || pos != strlen(arg))
+				return ERROR_COMMAND_SYNTAX_ERROR;
+
+			id = calloc(1, strlen(equals) + strlen(reg_type) + 2);
+			if (!id)
 				return ERROR_FAIL;
-			id = strdup(equals);
+
+			strcat(id, reg_type);
+			id[strlen(reg_type)] = '_';
+			if (sscanf(equals, "%[_a-zA-Z0-9]%n", id + strlen(reg_type) + 1, &pos) != 1 || pos != strlen(equals))
+				return ERROR_COMMAND_SYNTAX_ERROR;
 		} else
-			return ERROR_FAIL;
+			return ERROR_COMMAND_SYNTAX_ERROR;
 
 		high = high > low ? high : low;
 
-		/* Check for overlap. */
+		if (high > max_val) {
+			LOG_ERROR("Cannot expose %s register number %u, maximum allowed value is %u.", reg_type, high, max_val);
+			free(id);
+			return ERROR_FAIL;
+		}
+
+		/* Check for overlap, id uniqueness. */
 		range_list_t *entry;
-		list_for_each_entry(entry, ranges, list)
+		list_for_each_entry(entry, ranges, list) {
 			if ((entry->low <= high) && (low <= entry->high)) {
-				LOG_WARNING("Range starting from %u is overlapping with already "
-						"specified range starting from %u.", low, entry->low);
+				if (low == high)
+					LOG_WARNING("Duplicate %s register number - "
+							"Register %u has already been exposed previously", reg_type, low);
+				else
+					LOG_WARNING("Overlapping register ranges - Register range starting from %u overlaps "
+							"with already exposed register/range at %u.", low, entry->low);
 			}
 
+			if (entry->id && id && (strcmp(entry->id, id) == 0)) {
+				LOG_ERROR("Duplicate register id \"%s\" found.", id);
+				free(id);
+				return ERROR_FAIL;
+			}
+		}
+
 		range_list_t *range = calloc(1, sizeof(range_list_t));
-		if (!range)
+		if (!range) {
+			free(id);
 			return ERROR_FAIL;
+		}
 
 		range->low = low;
 		range->high = high;
@@ -2561,46 +2595,48 @@ int parse_ranges(struct list_head *ranges, char *args)
 
 COMMAND_HANDLER(riscv_set_expose_csrs)
 {
-	unsigned len = 0;
-	for (unsigned i = 0; i < CMD_ARGC; i++)
-		len += strlen(CMD_ARGV[i]);
-
-	char *args = calloc(len + 1, 1);
-	if (!args)
-		return ERROR_FAIL;
-
-	for (unsigned i = 0; i < CMD_ARGC; i++)
-		strcat(args, CMD_ARGV[i]);
+	if (CMD_ARGC == 0) {
+		LOG_ERROR("Command expects parameters");
+		return ERROR_COMMAND_SYNTAX_ERROR;
+	}
 
 	struct target *target = get_current_target(CMD_CTX);
 	RISCV_INFO(info);
+	int ret = ERROR_OK;
 
-	int ret = parse_ranges(&info->expose_csr, args);
+	for (unsigned i = 0; i < CMD_ARGC; i++) {
+		char *args = strdup(CMD_ARGV[i]);
 
-	free(args);
+		ret = parse_ranges(&info->expose_csr, args, "csr", 0xfff);
+
+		free(args);
+		if (ret != ERROR_OK)
+			break;
+	}
 
 	return ret;
 }
 
 COMMAND_HANDLER(riscv_set_expose_custom)
 {
-	unsigned len = 0;
-	for (unsigned i = 0; i < CMD_ARGC; i++)
-		len += strlen(CMD_ARGV[i]);
-
-	char *args = calloc(len + 1, 1);
-	if (!args)
-		return ERROR_FAIL;
-
-	for (unsigned i = 0; i < CMD_ARGC; i++)
-		strcat(args, CMD_ARGV[i]);
+	if (CMD_ARGC == 0) {
+		LOG_ERROR("Command expects parameters");
+		return ERROR_COMMAND_SYNTAX_ERROR;
+	}
 
 	struct target *target = get_current_target(CMD_CTX);
 	RISCV_INFO(info);
+	int ret = ERROR_OK;
 
-	int ret = parse_ranges(&info->expose_custom, args);
+	for (unsigned i = 0; i < CMD_ARGC; i++) {
+		char *args = strdup(CMD_ARGV[i]);
 
-	free(args);
+		ret = parse_ranges(&info->expose_custom, args, "custom", 0x3fff);
+
+		free(args);
+		if (ret != ERROR_OK)
+			break;
+	}
 
 	return ret;
 }
@@ -3929,28 +3965,6 @@ static int cmp_csr_info(const void *p1, const void *p2)
 	return (int) (((struct csr_info *)p1)->number) - (int) (((struct csr_info *)p2)->number);
 }
 
-static void riscv_expose_register(struct reg *r, char *name, char *registered_names, char *reg_name)
-{
-	if (name) {
-		/* Check whether the name is unique. */
-		bool reg_name_unique = true;
-		for (char *reg_name_tmp = registered_names; *reg_name_tmp;
-				reg_name_tmp += strlen(reg_name_tmp) + 1) {
-			if (strcmp(reg_name_tmp, name) == 0) {
-				LOG_WARNING("Register with name %s already registered.", reg_name_tmp);
-				reg_name_unique = false;
-				break;
-			}
-		}
-
-		if (reg_name_unique) {
-			*reg_name = 0;
-			r->name = name;
-			LOG_DEBUG("Exposed register will be available as %s", name);
-		}
-	}
-}
-
 int riscv_init_registers(struct target *target)
 {
 	RISCV_INFO(info);
@@ -4509,7 +4523,13 @@ int riscv_init_registers(struct target *target)
 				list_for_each_entry(entry, &info->expose_csr, list)
 					if ((entry->low <= csr_number) && (csr_number <= entry->high)) {
 						LOG_DEBUG("Exposing additional CSR %d", csr_number);
-						riscv_expose_register(r, entry->id, info->reg_names, reg_name);
+
+						if (entry->id) {
+							*reg_name = 0;
+							r->name = entry->id;
+							LOG_DEBUG("Exposed register will be available as %s", r->name);
+						}
+
 						r->exist = true;
 						break;
 					}
@@ -4548,7 +4568,12 @@ int riscv_init_registers(struct target *target)
 			sprintf(reg_name, "custom%d", custom_number);
 
 			LOG_DEBUG("Exposing additional custom register %d", number);
-			riscv_expose_register(r, range->id, info->reg_names, reg_name);
+
+			if (range->id) {
+				*reg_name = 0;
+				r->name = range->id;
+				LOG_DEBUG("Exposed register will be available as %s", r->name);
+			}
 
 			custom_within_range++;
 			if (custom_within_range > range->high - range->low) {
