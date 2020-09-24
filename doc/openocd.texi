@@ -9641,7 +9641,7 @@ OpenOCD exposes each hart as a separate core.
 
 @subsection RISC-V Debug Configuration Commands
 
-@deffn Command {riscv expose_csrs} n0[-m0|=name0][,n1[-m1|=name1]]...
+@deffn Command {riscv expose_csrs} n[-m|=name] [...]
 Configure which CSRs to expose in addition to the standard ones. The CSRs to expose
 can be specified as individual register numbers or register ranges (inclusive). For the
 individually listed CSRs, a human-readable name can optionally be set.
@@ -9653,7 +9653,7 @@ command can be used if OpenOCD gets this wrong, or a target implements custom
 CSRs.
 @end deffn
 
-@deffn Command {riscv expose_custom} n0[-m0|=name0][,n1[-m1|=name1]]...
+@deffn Command {riscv expose_custom} n[-m|=name] [...]
 The RISC-V Debug Specification allows targets to expose custom registers
 through abstract commands. (See Section 3.5.1.1 in that document.) This command
 configures individual registers or register ranges (inclusive) that shall be exposed.

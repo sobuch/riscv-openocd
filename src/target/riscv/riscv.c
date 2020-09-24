@@ -2503,8 +2503,13 @@ COMMAND_HANDLER(riscv_set_enable_virtual)
 	return ERROR_OK;
 }
 
-int parse_ranges(struct list_head *ranges, char *args, const char *reg_type, unsigned max_val)
+int parse_ranges(struct list_head *ranges, const char *tcl_arg, const char *reg_type, unsigned max_val)
 {
+	char *args = strdup(tcl_arg);
+	if (!args)
+		return ERROR_FAIL;
+
+	/* For backward compatibility, allow multiple parameters within one TCL argument, separated by ',' */
 	char *arg = strtok(args, ",");
 	while (arg) {
 		unsigned low = 0;
@@ -2517,43 +2522,59 @@ int parse_ranges(struct list_head *ranges, char *args, const char *reg_type, uns
 
 		if (!dash && !equals) {
 			/* Expecting single register number. */
-			if (sscanf(arg, "%u%n", &low, &pos) != 1 || pos != strlen(arg))
+			if (sscanf(arg, "%u%n", &low, &pos) != 1 || pos != strlen(arg)) {
+				free(args);
 				return ERROR_COMMAND_SYNTAX_ERROR;
+			}
 		} else if (dash && !equals) {
 			/* Expecting register range - two numbers separated by a dash: ##-## */
 			*dash = 0;
 			dash++;
-			if (sscanf(arg, "%u%n", &low, &pos) != 1 || pos != strlen(arg))
+			if (sscanf(arg, "%u%n", &low, &pos) != 1 || pos != strlen(arg)) {
+				free(args);
 				return ERROR_COMMAND_SYNTAX_ERROR;
-			if (sscanf(dash, "%u%n", &high, &pos) != 1 || pos != strlen(dash))
+			}
+			if (sscanf(dash, "%u%n", &high, &pos) != 1 || pos != strlen(dash)) {
+				free(args);
 				return ERROR_COMMAND_SYNTAX_ERROR;
+			}
 			if (high < low) {
 				LOG_ERROR("Incorrect range encountered [%u, %u].", low, high);
+				free(args);
 				return ERROR_FAIL;
 			}
 		} else if (!dash && equals) {
 			/* Expecting single register number with textual name specified: ##=name */
 			*equals = 0;
 			equals++;
-			if (sscanf(arg, "%u%n", &low, &pos) != 1 || pos != strlen(arg))
+			if (sscanf(arg, "%u%n", &low, &pos) != 1 || pos != strlen(arg)) {
+				free(args);
 				return ERROR_COMMAND_SYNTAX_ERROR;
+			}
 
 			id = calloc(1, strlen(equals) + strlen(reg_type) + 2);
 			if (!id)
 				return ERROR_FAIL;
 
-			strcat(id, reg_type);
+			/* Register prefix: "csr_" or "custom_" */
+			strcpy(id, reg_type);
 			id[strlen(reg_type)] = '_';
-			if (sscanf(equals, "%[_a-zA-Z0-9]%n", id + strlen(reg_type) + 1, &pos) != 1 || pos != strlen(equals))
+
+			if (sscanf(equals, "%[_a-zA-Z0-9]%n", id + strlen(reg_type) + 1, &pos) != 1 || pos != strlen(equals)) {
+				free(args);
 				return ERROR_COMMAND_SYNTAX_ERROR;
-		} else
+			}
+		} else {
+			free(args);
 			return ERROR_COMMAND_SYNTAX_ERROR;
+		}
 
 		high = high > low ? high : low;
 
 		if (high > max_val) {
 			LOG_ERROR("Cannot expose %s register number %u, maximum allowed value is %u.", reg_type, high, max_val);
 			free(id);
+			free(args);
 			return ERROR_FAIL;
 		}
 
@@ -2569,9 +2590,10 @@ int parse_ranges(struct list_head *ranges, char *args, const char *reg_type, uns
 							"with already exposed register/range at %u.", low, entry->low);
 			}
 
-			if (entry->id && id && (strcmp(entry->id, id) == 0)) {
-				LOG_ERROR("Duplicate register id \"%s\" found.", id);
+			if (entry->id && id && (strcasecmp(entry->id, id) == 0)) {
+				LOG_ERROR("Duplicate register name \"%s\" found.", id);
 				free(id);
+				free(args);
 				return ERROR_FAIL;
 			}
 		}
@@ -2579,6 +2601,7 @@ int parse_ranges(struct list_head *ranges, char *args, const char *reg_type, uns
 		range_list_t *range = calloc(1, sizeof(range_list_t));
 		if (!range) {
 			free(id);
+			free(args);
 			return ERROR_FAIL;
 		}
 
@@ -2590,6 +2613,7 @@ int parse_ranges(struct list_head *ranges, char *args, const char *reg_type, uns
 		arg = strtok(NULL, ",");
 	}
 
+	free(args);
 	return ERROR_OK;
 }
 
@@ -2605,11 +2629,7 @@ COMMAND_HANDLER(riscv_set_expose_csrs)
 	int ret = ERROR_OK;
 
 	for (unsigned i = 0; i < CMD_ARGC; i++) {
-		char *args = strdup(CMD_ARGV[i]);
-
-		ret = parse_ranges(&info->expose_csr, args, "csr", 0xfff);
-
-		free(args);
+		ret = parse_ranges(&info->expose_csr, CMD_ARGV[i], "csr", 0xfff);
 		if (ret != ERROR_OK)
 			break;
 	}
@@ -2629,11 +2649,7 @@ COMMAND_HANDLER(riscv_set_expose_custom)
 	int ret = ERROR_OK;
 
 	for (unsigned i = 0; i < CMD_ARGC; i++) {
-		char *args = strdup(CMD_ARGV[i]);
-
-		ret = parse_ranges(&info->expose_custom, args, "custom", 0x3fff);
-
-		free(args);
+		ret = parse_ranges(&info->expose_custom, CMD_ARGV[i], "custom", 0x3fff);
 		if (ret != ERROR_OK)
 			break;
 	}
@@ -4522,13 +4538,13 @@ int riscv_init_registers(struct target *target)
 				range_list_t *entry;
 				list_for_each_entry(entry, &info->expose_csr, list)
 					if ((entry->low <= csr_number) && (csr_number <= entry->high)) {
-						LOG_DEBUG("Exposing additional CSR %d", csr_number);
-
 						if (entry->id) {
 							*reg_name = 0;
 							r->name = entry->id;
-							LOG_DEBUG("Exposed register will be available as %s", r->name);
 						}
+
+						LOG_DEBUG("Exposing additional CSR %d (name=%s)",
+								csr_number, entry->id ? entry->id : reg_name);
 
 						r->exist = true;
 						break;
@@ -4567,13 +4583,13 @@ int riscv_init_registers(struct target *target)
 			((riscv_reg_info_t *) r->arch_info)->custom_number = custom_number;
 			sprintf(reg_name, "custom%d", custom_number);
 
-			LOG_DEBUG("Exposing additional custom register %d", number);
-
 			if (range->id) {
 				*reg_name = 0;
 				r->name = range->id;
-				LOG_DEBUG("Exposed register will be available as %s", r->name);
 			}
+
+			LOG_DEBUG("Exposing additional custom register %d (name=%s)",
+					number, range->id ? range->id : reg_name);
 
 			custom_within_range++;
 			if (custom_within_range > range->high - range->low) {
