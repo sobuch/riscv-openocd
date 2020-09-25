@@ -1651,13 +1651,12 @@ int jtag_init_inner(struct command_context *cmd_ctx)
 
 int adapter_quit(void)
 {
-	if (jtag && jtag->quit) {
+	if (adapter_driver && adapter_driver->quit) {
 		/* close the JTAG interface */
-		int result = jtag->quit();
+		int result = adapter_driver->quit();
 		if (ERROR_OK != result)
 			LOG_ERROR("failed: %d", result);
-	} else if (adapter_driver && adapter_driver->quit)
-		adapter_driver->quit();
+	}
 
 	jtag = NULL;
 	adapter_driver = NULL;
