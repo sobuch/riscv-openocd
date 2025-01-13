@@ -21,6 +21,7 @@
 #include "helper/time_support.h"
 #include "riscv.h"
 #include "riscv_reg.h"
+#include "riscv_reg_impl.h"
 #include "program.h"
 #include "gdb_regs.h"
 #include "rtos/rtos.h"
@@ -4361,6 +4362,9 @@ COMMAND_HANDLER(riscv_hide_csrs)
 			break;
 	}
 
+	if (target_was_examined(target))
+		riscv_reg_impl_hide_csrs(target);
+
 	return ret;
 }
 
@@ -5409,12 +5413,11 @@ static const struct command_registration riscv_exec_command_handlers[] = {
 	{
 		.name = "hide_csrs",
 		.handler = riscv_hide_csrs,
-		.mode = COMMAND_CONFIG,
+		.mode = COMMAND_ANY,
 		.usage = "{n0|n-m0}[,n1|n-m1]......",
 		.help = "Configure a list of inclusive ranges for CSRs to hide from gdb. "
 			"Hidden registers are still available, but are not listed in "
 			"gdb target description and `reg` command output. "
-			"This must be executed before `init`."
 	},
 	{
 		.name = "authdata_read",
